@@ -1,0 +1,41 @@
+@host = http://localhost:5154
+
+### Health
+GET {{host}}/health
+Accept: application/json
+
+### List packs
+GET {{host}}/packs/
+Accept: application/json
+
+### Pack summary
+GET {{host}}/packs/example-pack
+Accept: application/json
+
+### Manifest (latest)
+GET {{host}}/packs/example-pack/manifest
+Accept: application/json
+
+### Diff
+POST {{host}}/packs/example-pack/diff
+Content-Type: application/json
+
+{
+  "files": [
+    { "path": "mods/example.jar", "sha256": "deadbeef", "size": 123 }
+  ]
+}
+
+### Download single file
+GET {{host}}/packs/example-pack/file?path=mods/example.jar
+
+### Bundle download
+POST {{host}}/packs/example-pack/bundle
+Content-Type: application/json
+
+{
+  "paths": [
+    "mods/example.jar",
+    "config/some.cfg"
+  ]
+}
