@@ -1,4 +1,4 @@
-# ModPackUpdater
+# ModPackUpdater 
 
 A tiny ASP.NET Core service and CLI that hosts the "latest" version of Minecraft modpacks. Clients fetch a manifest (SHA-256 + size) and download changed files; the server never computes diffs. Includes a simple importer for .mcpack, .mrpack, or .zip archives.
 
@@ -7,7 +7,7 @@ A tiny ASP.NET Core service and CLI that hosts the "latest" version of Minecraft
 - Paths: forward slashes, safe-relative only (no leading `/`, no `..`)
 - Logs: structured with Serilog to console and `logs/`
 
-See docs/CLIENT.md for a client mod integration guide.
+See docs/CLIENT.md for a client mod integration guide. For deployment and admin usage, see docs/SERVER.md.
 
 ## Quick start
 
@@ -151,4 +151,3 @@ dotnet test ModPackUpdater.sln -v minimal
 ## License
 
 GPL-3.0 (see LICENSE.txt)
-
