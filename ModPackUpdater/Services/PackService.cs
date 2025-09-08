@@ -1,5 +1,4 @@
 using System.Collections.Concurrent;
-using System.IO.Compression;
 using System.Security.Cryptography;
 using System.Text.Json;
 using ModPackUpdater.Models;
@@ -12,7 +11,7 @@ public class PackService
 
     private static readonly string[] DefaultIgnoreNames =
     {
-        "pack.json", // metadata file per version directory
+        "pack.json", // metadata file per pack directory
         ".DS_Store",
         "Thumbs.db"
     };
@@ -35,44 +34,27 @@ public class PackService
 
     public IReadOnlyList<string> GetVersions(string packId)
     {
-        var packPath = Path.Combine(_root, packId);
-        if (!Directory.Exists(packPath)) return Array.Empty<string>();
-        var versions = Directory.EnumerateDirectories(packPath)
-            .Select(Path.GetFileName)
-            .Where(n => !string.IsNullOrWhiteSpace(n))!
-            .Cast<string>()
-            .ToList();
-        // simple sort: try to sort by semantic-ish numeric segments, then lexicographic desc
-        versions.Sort(CompareVersionDesc);
-        return versions;
-    }
-
-    private static int CompareVersionDesc(string? a, string? b)
-    {
-        if (a == null && b == null) return 0;
-        if (a == null) return 1;
-        if (b == null) return -1;
-        // try System.Version
-        if (Version.TryParse(a, out var va) && Version.TryParse(b, out var vb))
-            return -va.CompareTo(vb);
-        // fallback: lexicographic desc
-        return string.Compare(b, a, StringComparison.OrdinalIgnoreCase);
+        var dir = GetPackPath(packId);
+        if (dir is null) return Array.Empty<string>();
+        // Single-version model: always 'latest'
+        return new[] { "latest" };
     }
 
     public string? GetLatestVersion(string packId)
     {
-        return GetVersions(packId).FirstOrDefault();
+        var dir = GetPackPath(packId);
+        return dir is not null ? "latest" : null;
     }
 
     public async Task<ModPackManifest?> TryGetManifestAsync(string packId, string version, CancellationToken ct)
     {
-        var dir = GetPackVersionPath(packId, version);
+        var dir = GetPackPath(packId);
         if (dir == null) return null;
         var meta = await ReadPackMetaAsync(dir, ct);
         var files = await EnumerateFilesWithHashesAsync(dir, ct);
         var manifest = new ModPackManifest(
             PackId: packId,
-            Version: version,
+            Version: "latest",
             DisplayName: meta?.DisplayName ?? packId,
             McVersion: meta?.McVersion,
             Loader: meta?.LoaderName != null || meta?.LoaderVersion != null
@@ -86,14 +68,14 @@ public class PackService
         return manifest;
     }
 
-    private async Task<PackMeta?> ReadPackMetaAsync(string versionDir, CancellationToken ct)
+    private async Task<PackMeta?> ReadPackMetaAsync(string dir, CancellationToken ct)
     {
-        var metaPath = Path.Combine(versionDir, "pack.json");
+        var metaPath = Path.Combine(dir, "pack.json");
         if (!File.Exists(metaPath)) return null;
         await using var fs = File.OpenRead(metaPath);
         try
         {
-            var meta = await JsonSerializer.DeserializeAsync(fs, AppJsonSerializerContext.Default.PackMeta, ct);
+            var meta = await JsonSerializer.DeserializeAsync<PackMeta>(fs, cancellationToken: ct);
             return meta;
         }
         catch
@@ -102,20 +84,38 @@ public class PackService
         }
     }
 
-    private async Task<IReadOnlyList<FileEntry>> EnumerateFilesWithHashesAsync(string versionDir, CancellationToken ct)
+    private async Task<IReadOnlyList<FileEntry>> EnumerateFilesWithHashesAsync(string dir, CancellationToken ct)
     {
-        var all = Directory.EnumerateFiles(versionDir, "*", SearchOption.AllDirectories)
-            .Where(p => !ShouldIgnore(versionDir, p))
+        // Avoid traversing into symlinked directories and skip symlinked files
+        var opts = new EnumerationOptions
+        {
+            RecurseSubdirectories = true,
+            IgnoreInaccessible = true,
+            AttributesToSkip = FileAttributes.ReparsePoint | FileAttributes.System
+        };
+
+        var all = Directory.EnumerateFiles(dir, "*", opts)
+            .Where(p => !ShouldIgnore(dir, p))
             .ToList();
 
         var results = new ConcurrentBag<FileEntry>();
 
         await Task.WhenAll(all.Select(async path =>
         {
-            var rel = GetRelative(versionDir, path);
-            var fi = new FileInfo(path);
-            var hash = await ComputeSha256Async(path, ct);
-            results.Add(new FileEntry(rel, hash, fi.Length));
+            try
+            {
+                if (IsSymlink(path)) return; // skip symlink files
+                if (HasSymlinkAncestor(dir, path)) return; // skip files under symlinked dirs
+
+                var rel = GetRelative(dir, path);
+                var fi = new FileInfo(path);
+                var hash = await ComputeSha256Async(path, ct);
+                results.Add(new FileEntry(rel, hash, fi.Length));
+            }
+            catch
+            {
+                // Skip files we can't read/hash
+            }
         }));
 
         return results.OrderBy(f => f.Path, StringComparer.OrdinalIgnoreCase).ToList();
@@ -132,7 +132,7 @@ public class PackService
     {
         var name = Path.GetFileName(path);
         if (DefaultIgnoreNames.Contains(name, StringComparer.OrdinalIgnoreCase)) return true;
-        // ignore dot-directories like .git inside pack version
+        // ignore dot-directories like .git inside pack
         var rel = Path.GetRelativePath(root, path);
         if (rel.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
             .Any(seg => seg.StartsWith('.'))) return true;
@@ -147,88 +147,30 @@ public class PackService
         return Convert.ToHexString(hash).ToLowerInvariant();
     }
 
-    private string? GetPackVersionPath(string packId, string version)
+    private string? GetPackPath(string packId)
     {
-        var dir = Path.Combine(_root, packId, version);
+        var dir = Path.Combine(_root, packId);
         dir = Path.GetFullPath(dir);
-        // ensure within root
         if (!dir.StartsWith(_root, StringComparison.Ordinal)) return null;
         return Directory.Exists(dir) ? dir : null;
-    }
-
-    public async Task<DiffResponse?> DiffAsync(string packId, string version, DiffRequest request, CancellationToken ct)
-    {
-        var manifest = await TryGetManifestAsync(packId, version, ct);
-        if (manifest == null) return null;
-
-        var serverMap = manifest.Files.ToDictionary(f => f.Path, StringComparer.OrdinalIgnoreCase);
-        var clientMap = (request.Files ?? Array.Empty<ClientFile>()).ToDictionary(f => f.Path, StringComparer.OrdinalIgnoreCase);
-
-        var ops = new List<Operation>();
-
-        // additions or updates
-        foreach (var kv in serverMap)
-        {
-            var path = kv.Key;
-            var s = kv.Value;
-            if (!clientMap.TryGetValue(path, out var c))
-            {
-                ops.Add(new Operation(path, FileOp.Add, s.Sha256, s.Size));
-            }
-            else if (!string.Equals(c.Sha256, s.Sha256, StringComparison.OrdinalIgnoreCase))
-            {
-                ops.Add(new Operation(path, FileOp.Update, s.Sha256, s.Size));
-            }
-        }
-
-        // deletions
-        foreach (var kv in clientMap)
-        {
-            var path = kv.Key;
-            if (!serverMap.ContainsKey(path))
-            {
-                ops.Add(new Operation(path, FileOp.Delete));
-            }
-        }
-
-        return new DiffResponse(packId, version, ops);
     }
 
     public bool TryResolveFile(string packId, string version, string relativePath, out string? absolutePath)
     {
         absolutePath = null;
-        var dir = GetPackVersionPath(packId, version);
+        var dir = GetPackPath(packId);
         if (dir == null) return false;
 
         if (!IsSafeRelative(relativePath)) return false;
         var full = Path.GetFullPath(Path.Combine(dir, relativePath));
-        if (!full.StartsWith(dir, StringComparison.Ordinal)) return false;
-        if (!File.Exists(full)) return false;
+        if (!full.StartsWith(dir, StringComparison.Ordinal) || !File.Exists(full)) return false;
+
+        // Reject symlinked files or files under symlinked directories
+        if (IsSymlink(full)) return false;
+        if (HasSymlinkAncestor(dir, full)) return false;
+
         absolutePath = full;
         return true;
-    }
-
-    public async Task WriteBundleAsync(Stream output, string packId, string version, IEnumerable<string> paths, CancellationToken ct)
-    {
-        var dir = GetPackVersionPath(packId, version) ?? throw new DirectoryNotFoundException();
-
-        await using var ms = new MemoryStream();
-        using (var zip = new ZipArchive(ms, ZipArchiveMode.Create, leaveOpen: true))
-        {
-            foreach (var rel in paths.Distinct(StringComparer.OrdinalIgnoreCase))
-            {
-                if (!IsSafeRelative(rel)) continue;
-                var full = Path.GetFullPath(Path.Combine(dir, rel));
-                if (!full.StartsWith(dir, StringComparison.Ordinal) || !File.Exists(full)) continue;
-
-                var entry = zip.CreateEntry(rel.Replace('\\', '/'), CompressionLevel.Optimal);
-                await using var entryStream = entry.Open();
-                await using var fs = File.OpenRead(full);
-                await fs.CopyToAsync(entryStream, ct);
-            }
-        }
-        ms.Position = 0;
-        await ms.CopyToAsync(output, ct);
     }
 
     private static bool IsSafeRelative(string path)
@@ -239,5 +181,40 @@ public class PackService
         if (normalized.Contains("../")) return false;
         if (normalized.Contains("..\\")) return false;
         return true;
+    }
+
+    private static bool IsSymlink(string path)
+    {
+        try
+        {
+            var attrs = File.GetAttributes(path);
+            return attrs.HasFlag(FileAttributes.ReparsePoint);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool HasSymlinkAncestor(string baseDir, string path)
+    {
+        try
+        {
+            var baseFull = Path.GetFullPath(baseDir).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            var current = new DirectoryInfo(Path.GetDirectoryName(path)!);
+            while (current != null)
+            {
+                var curFull = current.FullName.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                if (!curFull.StartsWith(baseFull, StringComparison.Ordinal)) break;
+                if (current.Attributes.HasFlag(FileAttributes.ReparsePoint)) return true;
+                if (string.Equals(curFull, baseFull, StringComparison.Ordinal)) break;
+                current = current.Parent;
+            }
+        }
+        catch
+        {
+            // if in doubt, do not treat as having symlink ancestor
+        }
+        return false;
     }
 }

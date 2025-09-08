@@ -1,5 +1,3 @@
-using System.IO.Compression;
-using System.Net.Http.Json;
 using System.Text;
 using System.Text.Json;
 using Microsoft.AspNetCore.Hosting;
@@ -38,8 +36,8 @@ public class IntegrationTests
     private static async Task<(TestAppFactory factory, HttpClient client, string root)> CreateAppAsync()
     {
         var root = Directory.CreateTempSubdirectory("packs-test-").FullName;
-        // Seed a sample pack
-        var packDir = Path.Combine(root, "example-pack", "1.0.0");
+        // Seed a sample pack (single version: latest)
+        var packDir = Path.Combine(root, "example-pack");
         Directory.CreateDirectory(Path.Combine(packDir, "mods"));
         Directory.CreateDirectory(Path.Combine(packDir, "config"));
         await File.WriteAllTextAsync(Path.Combine(packDir, "pack.json"),
@@ -96,7 +94,7 @@ public class IntegrationTests
             using var summaryDoc = JsonDocument.Parse(summaryText);
             var summary = summaryDoc.RootElement;
             Assert.Equal("example-pack", summary.GetProperty("packId").GetString());
-            Assert.Equal("1.0.0", summary.GetProperty("latestVersion").GetString());
+            Assert.Equal("latest", summary.GetProperty("latestVersion").GetString());
 
             // Manifest
             var manifestText = await client.GetStringAsync("/packs/example-pack/manifest");
@@ -104,46 +102,14 @@ public class IntegrationTests
             using var manifestDoc = JsonDocument.Parse(manifestText);
             var manifest = manifestDoc.RootElement;
             Assert.Equal("example-pack", manifest.GetProperty("packId").GetString());
-            Assert.Equal("1.0.0", manifest.GetProperty("version").GetString());
+            Assert.Equal("latest", manifest.GetProperty("version").GetString());
             var files = manifest.GetProperty("files");
             Assert.True(files.GetArrayLength() >= 2);
-
-            // Diff (client has one file with wrong hash; expects Update + Add for the other)
-            var diffReq = JsonContent.Create(new
-            {
-                files = new[]
-                {
-                    new { path = "mods/example.jar", sha256 = "deadbeef", size = 123 }
-                }
-            });
-            var diffResp = await client.PostAsync("/packs/example-pack/diff", diffReq);
-            var diffText = await diffResp.Content.ReadAsStringAsync();
-            _output.WriteLine($"/packs/example-pack/diff: {diffText}");
-            diffResp.EnsureSuccessStatusCode();
-            using var diffDoc = JsonDocument.Parse(diffText);
-            var diff = diffDoc.RootElement;
-            var ops = diff.GetProperty("operations");
-            Assert.True(ops.GetArrayLength() >= 2);
-            var opPaths = ops.EnumerateArray().Select(o => o.GetProperty("path").GetString()).ToArray();
-            Assert.Contains("mods/example.jar", opPaths);
-            Assert.Contains("config/some.cfg", opPaths);
 
             // Single file download
             var text = await client.GetStringAsync("/packs/example-pack/file?path=config/some.cfg");
             _output.WriteLine($"download file content: {text}");
             Assert.Equal("key=value", text);
-
-            // Bundle download and inspect zip entries
-            var bundleReq = JsonContent.Create(new { paths = new[] { "mods/example.jar", "config/some.cfg" } });
-            var bundleResp = await client.PostAsync("/packs/example-pack/bundle", bundleReq);
-            _output.WriteLine($"bundle status: {(int)bundleResp.StatusCode}");
-            bundleResp.EnsureSuccessStatusCode();
-            await using var bundleStream = await bundleResp.Content.ReadAsStreamAsync();
-            using var zip = new ZipArchive(bundleStream, ZipArchiveMode.Read, leaveOpen: false);
-            var names = zip.Entries.Select(e => e.FullName).ToArray();
-            _output.WriteLine($"bundle entries: {string.Join(", ", names)}");
-            Assert.Contains("mods/example.jar", names);
-            Assert.Contains("config/some.cfg", names);
         }
         finally
         {

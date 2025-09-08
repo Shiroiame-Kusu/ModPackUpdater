@@ -2,101 +2,158 @@ using System.Text.Json.Serialization;
 using Microsoft.AspNetCore.Http.HttpResults;
 using ModPackUpdater.Models;
 using ModPackUpdater.Services;
+using Serilog;
+using Serilog.Events;
+using ModPackUpdater.Filters;
+using Microsoft.Extensions.Configuration; // added for CLI config loading
 
 namespace ModPackUpdater;
 
 public class Program
 {
-    public static void Main(string[] args)
+    public static async Task Main(string[] args)
     {
+        // Simple CLI: `import` subcommand to create packs from a .mcpack/.zip
+        if (args.Length > 0 && string.Equals(args[0], "import", StringComparison.OrdinalIgnoreCase))
+        {
+            var (file, packId, version, overwrite, showHelp) = ParseImportArgs(args);
+            if (showHelp || string.IsNullOrWhiteSpace(file))
+            {
+                PrintImportHelp();
+                Environment.Exit(showHelp ? 0 : 2);
+                return; // just in case
+            }
+
+            // Load configuration similarly to the web app to resolve PacksRoot
+            var env = Environment.GetEnvironmentVariable("ASPNETCORE_ENVIRONMENT") ?? "Production";
+            var config = new ConfigurationBuilder()
+                .SetBasePath(AppContext.BaseDirectory)
+                .AddJsonFile("appsettings.json", optional: true)
+                .AddJsonFile($"appsettings.{env}.json", optional: true)
+                .AddEnvironmentVariables()
+                .Build();
+            var cfgRoot = config["PacksRoot"];
+            var packsRoot = !string.IsNullOrWhiteSpace(cfgRoot)
+                ? (Path.IsPathRooted(cfgRoot) ? cfgRoot : Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, cfgRoot)))
+                : Path.Combine(AppContext.BaseDirectory, "packs");
+
+            // Delegate inference to importer; pass through optional overrides if provided
+            var code = await PackImportService.Import(packsRoot, new PackImportService.ImportOptions(file!, packId, version, overwrite));
+            Environment.Exit(code);
+            return;
+        }
+
         var builder = WebApplication.CreateSlimBuilder(args);
+
+        // Ensure logs directory exists early
+        try { Directory.CreateDirectory(Path.Combine(AppContext.BaseDirectory, "logs")); } catch { /* ignore */ }
+
+        // Serilog configuration from appsettings
+        builder.Host.UseSerilog((ctx, services, cfg) =>
+        {
+            cfg.ReadFrom.Configuration(ctx.Configuration)
+               .Enrich.FromLogContext();
+        });
 
         // Services
         builder.Services.AddSingleton<PackService>(sp =>
         {
             var cfg = sp.GetRequiredService<IConfiguration>();
-            var root = cfg["PacksRoot"] ?? Path.Combine(AppContext.BaseDirectory, "packs");
+            var cfgRoot = cfg["PacksRoot"];
+            var root = !string.IsNullOrWhiteSpace(cfgRoot)
+                ? (Path.IsPathRooted(cfgRoot) ? cfgRoot : Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, cfgRoot)))
+                : Path.Combine(AppContext.BaseDirectory, "packs");
+            Log.Information("PacksRoot resolved to {PacksRoot}", root);
             return new PackService(root);
         });
-        builder.Services.ConfigureHttpJsonOptions(options =>
+        builder.Services.AddControllers(options =>
         {
-            options.SerializerOptions.TypeInfoResolverChain.Insert(0, AppJsonSerializerContext.Default);
+            options.Filters.Add<ComponentLoggingFilter>();
         });
 
         var app = builder.Build();
 
-        // Health
-        app.MapGet("/health", () => Results.Ok(new { status = "ok" }));
+        // Correlation + LogContext enrichment must come before request logging
+        app.UseMiddleware<Middleware.CorrelationLoggingMiddleware>();
 
-        var packs = app.MapGroup("/packs");
-
-        // List packs
-        packs.MapGet("/", (PackService svc) => Results.Ok(svc.GetPackIds()));
-
-        // Pack summary with versions
-        packs.MapGet("/{packId}", (string packId, PackService svc) =>
+        // HTTP request access logging
+        app.UseSerilogRequestLogging(options =>
         {
-            var versions = svc.GetVersions(packId);
-            if (versions.Count == 0) return Results.NotFound();
-            var latest = versions.First();
-            var summary = new PackSummary(packId, latest, versions);
-            return Results.Ok(summary);
+            // Customize message and enrich diagnostic context
+            options.MessageTemplate = "HTTP {RequestMethod} {RequestPath} responded {StatusCode} in {Elapsed:0.0000} ms";
+            options.EnrichDiagnosticContext = (diag, httpContext) =>
+            {
+                var req = httpContext.Request;
+                diag.Set("RequestHost", req.Host.Value);
+                diag.Set("RequestScheme", req.Scheme);
+                diag.Set("UserAgent", req.Headers.UserAgent.ToString());
+                diag.Set("QueryString", req.QueryString.HasValue ? req.QueryString.Value : "");
+                diag.Set("RemoteIpAddress", httpContext.Connection.RemoteIpAddress?.ToString());
+                if (httpContext.Items.TryGetValue("CorrelationId", out var corr) && corr is string s)
+                    diag.Set("CorrelationId", s);
+            };
+            // Leave default GetLevel (Info, Error on 5xx)
         });
 
-        // Manifest of a specific or latest version
-        packs.MapGet("/{packId}/manifest", async Task<Results<Ok<ModPackManifest>, NotFound>> (string packId, string? version, PackService svc, CancellationToken ct) =>
-        {
-            version ??= svc.GetLatestVersion(packId);
-            if (string.IsNullOrWhiteSpace(version)) return TypedResults.NotFound();
-            var manifest = await svc.TryGetManifestAsync(packId, version!, ct);
-            return manifest is null ? TypedResults.NotFound() : TypedResults.Ok(manifest);
-        });
-
-        // Diff between client file list and server manifest
-        packs.MapPost("/{packId}/diff", async Task<Results<Ok<DiffResponse>, NotFound>> (string packId, string? version, DiffRequest req, PackService svc, CancellationToken ct) =>
-        {
-            version ??= svc.GetLatestVersion(packId);
-            if (string.IsNullOrWhiteSpace(version)) return TypedResults.NotFound();
-            var diff = await svc.DiffAsync(packId, version!, req, ct);
-            return diff is null ? TypedResults.NotFound() : TypedResults.Ok(diff);
-        });
-
-        // Download a single file by relative path (query: path, version)
-        packs.MapGet("/{packId}/file", (string packId, string? version, string path, PackService svc) =>
-        {
-            version ??= svc.GetLatestVersion(packId);
-            if (string.IsNullOrWhiteSpace(version)) return Results.NotFound();
-            if (!svc.TryResolveFile(packId, version!, path, out var full)) return Results.NotFound();
-            var fileName = System.IO.Path.GetFileName(path);
-            return Results.File(full!, contentType: "application/octet-stream", fileDownloadName: fileName, enableRangeProcessing: true);
-        });
-
-        // Download a bundle zip for a set of relative paths
-        packs.MapPost("/{packId}/bundle", async Task<IResult> (HttpContext ctx, string packId, string? version, BundleRequest req, PackService svc, CancellationToken ct) =>
-        {
-            version ??= svc.GetLatestVersion(packId);
-            if (string.IsNullOrWhiteSpace(version)) return Results.NotFound();
-
-            ctx.Response.ContentType = "application/zip";
-            var fileName = $"{packId}-{version}-bundle.zip";
-            ctx.Response.Headers.ContentDisposition = $"attachment; filename=\"{fileName}\"";
-
-            await svc.WriteBundleAsync(ctx.Response.Body, packId, version!, req.Paths ?? Array.Empty<string>(), ct);
-            return Results.Empty;
-        });
+        app.MapControllers();
 
         app.Run();
     }
+
+    private static (string? file, string? packId, string? version, bool overwrite, bool help) ParseImportArgs(string[] args)
+    {
+        string? file = null, packId = null, version = null; bool overwrite = false, help = false;
+        for (int i = 1; i < args.Length; i++)
+        {
+            var a = args[i];
+            switch (a)
+            {
+                case "--file":
+                case "-f":
+                    if (i + 1 < args.Length) file = args[++i];
+                    break;
+                case "--pack":
+                case "-p":
+                    if (i + 1 < args.Length) packId = args[++i];
+                    break;
+                case "--version":
+                case "-v":
+                    if (i + 1 < args.Length) version = args[++i]; // accepted but ignored in single-version mode
+                    break;
+                case "--overwrite":
+                case "-y":
+                    overwrite = true;
+                    break;
+                case "--help":
+                case "-h":
+                    help = true;
+                    break;
+                default:
+                    // Allow bare argument as file path if not set yet
+                    if (string.IsNullOrEmpty(file)) file = a;
+                    break;
+            }
+        }
+        return (file, packId, version, overwrite, help);
+    }
+
+    private static void PrintImportHelp()
+    {
+        Console.WriteLine(@"Usage:
+  ModPackUpdater import --file <path.(mcpack|mrpack|zip)> [--pack <id>] [--overwrite]
+
+Imports the given archive into the packs directory configured by PacksRoot (or ./packs by default).
+This app uses a single-version model; each pack lives at packs/<id>/ and always represents 'latest'.
+The importer reads name and metadata from inside the archive when possible (Bedrock manifest.json, CurseForge manifest.json, Modrinth modrinth.index.json).
+If pack id is still unknown, it falls back to the filename (before the last '-').
+
+Options:
+  -f, --file        Path to .mcpack, .mrpack, or .zip
+  -p, --pack        Pack ID override (folder name under packs/)
+  -y, --overwrite   Replace the existing pack folder if it exists
+  -h, --help        Show this help
+");
+    }
 }
 
-// JSON source generation context for AOT-friendly serialization
-[JsonSerializable(typeof(IEnumerable<string>))]
-[JsonSerializable(typeof(PackSummary))]
-[JsonSerializable(typeof(ModPackManifest))]
-[JsonSerializable(typeof(DiffRequest))]
-[JsonSerializable(typeof(DiffResponse))]
-[JsonSerializable(typeof(BundleRequest))]
-[JsonSerializable(typeof(PackMeta))]
-internal partial class AppJsonSerializerContext : JsonSerializerContext
-{
-}
+// JSON source generation removed; relying on default reflection-based System.Text.Json
