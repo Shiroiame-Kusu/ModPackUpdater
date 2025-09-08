@@ -6,6 +6,7 @@ using Serilog;
 using Serilog.Events;
 using ModPackUpdater.Filters;
 using Microsoft.Extensions.Configuration; // added for CLI config loading
+using Microsoft.Extensions.Caching.Memory; // added for in-memory cache
 
 namespace ModPackUpdater;
 
@@ -55,6 +56,13 @@ public class Program
                .Enrich.FromLogContext();
         });
 
+        // Caching
+        builder.Services.AddMemoryCache(options =>
+        {
+            // Small size limit; entries are 1 size each
+            options.SizeLimit = 1024; // up to 1024 cached manifests
+        });
+
         // Services
         builder.Services.AddSingleton<PackService>(sp =>
         {
@@ -64,7 +72,7 @@ public class Program
                 ? (Path.IsPathRooted(cfgRoot) ? cfgRoot : Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, cfgRoot)))
                 : Path.Combine(AppContext.BaseDirectory, "packs");
             Log.Information("PacksRoot resolved to {PacksRoot}", root);
-            return new PackService(root);
+            return new PackService(root, sp.GetRequiredService<IMemoryCache>(), sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<PackService>>());
         });
         builder.Services.AddControllers(options =>
         {
@@ -87,7 +95,7 @@ public class Program
                 diag.Set("RequestHost", req.Host.Value);
                 diag.Set("RequestScheme", req.Scheme);
                 diag.Set("UserAgent", req.Headers.UserAgent.ToString());
-                diag.Set("QueryString", req.QueryString.HasValue ? req.QueryString.Value : "");
+                diag.Set("QueryString", httpContext.Request.QueryString.HasValue ? httpContext.Request.QueryString.Value : "");
                 diag.Set("RemoteIpAddress", httpContext.Connection.RemoteIpAddress?.ToString());
                 if (httpContext.Items.TryGetValue("CorrelationId", out var corr) && corr is string s)
                     diag.Set("CorrelationId", s);

@@ -4,6 +4,8 @@ using System.Text.RegularExpressions;
 using ModPackUpdater.Models;
 using System.Net.Http; // added
 using System.Security.Cryptography; // added
+using System.Collections.Concurrent; // added for results aggregation
+using System.Diagnostics; // added for timing
 
 namespace ModPackUpdater.Services;
 
@@ -451,10 +453,17 @@ public static class PackImportService
         using var http = new HttpClient();
         http.Timeout = TimeSpan.FromSeconds(60);
 
-        // simple bounded concurrency
         var throttler = new SemaphoreSlim(initialCount: Math.Clamp(Environment.ProcessorCount, 2, 8));
         var tasks = new List<Task>();
-        int completed = 0;
+        var results = new ConcurrentBag<(string Path, bool Ok, string? Url, long Bytes, long Ms, string? Error)>();
+
+        Console.WriteLine("Download plan:");
+        foreach (var f in files)
+        {
+            Console.WriteLine($"  - {f.Path}");
+        }
+
+        int started = 0;
         foreach (var f in files)
         {
             await throttler.WaitAsync();
@@ -462,14 +471,23 @@ public static class PackImportService
             {
                 try
                 {
-                    await DownloadOneAsync(http, targetDir, f);
-                    var done = Interlocked.Increment(ref completed);
-                    if (done % 5 == 0 || done == files.Count)
-                        Console.WriteLine($"  downloaded {done}/{files.Count}...");
+                    var index = Interlocked.Increment(ref started);
+                    Console.WriteLine($"[{index}/{files.Count}] start {f.Path}");
+                    var res = await DownloadOneAsync(http, targetDir, f);
+                    if (res.Ok)
+                    {
+                        Console.WriteLine($"[{index}/{files.Count}] ok    {f.Path} ({res.Bytes} bytes in {res.Ms} ms) <- {res.Url}");
+                    }
+                    else
+                    {
+                        Console.Error.WriteLine($"[{index}/{files.Count}] fail  {f.Path} : {res.Error}");
+                    }
+                    results.Add((f.Path, res.Ok, res.Url, res.Bytes, res.Ms, res.Error));
                 }
                 catch (Exception ex)
                 {
-                    Console.Error.WriteLine($"  failed to download {f.Path}: {ex.Message}");
+                    Console.Error.WriteLine($"fail  {f.Path} : {ex.Message}");
+                    results.Add((f.Path, false, null, 0L, 0L, ex.Message));
                 }
                 finally
                 {
@@ -478,52 +496,70 @@ public static class PackImportService
             }));
         }
         await Task.WhenAll(tasks);
+
+        var ok = results.Count(r => r.Ok);
+        var bad = results.Count(r => !r.Ok);
+        Console.WriteLine($"Download summary: {ok} succeeded, {bad} failed");
+        if (bad > 0)
+        {
+            Console.Error.WriteLine("Failures:");
+            foreach (var r in results.Where(r => !r.Ok).OrderBy(r => r.Path))
+                Console.Error.WriteLine($"  - {r.Path}: {r.Error}");
+        }
     }
 
-    private static async Task DownloadOneAsync(HttpClient http, string targetDir, MrFile f)
+    private static async Task<(bool Ok, string? Url, long Bytes, long Ms, string? Error)> DownloadOneAsync(HttpClient http, string targetDir, MrFile f)
     {
         // Skip unsupported env entries (if pack is client-side by default)
         if (string.Equals(f.EnvClient, "unsupported", StringComparison.OrdinalIgnoreCase))
-            return;
+            return (true, null, 0L, 0L, null); // treat as skipped-ok
 
         var rel = f.Path.Replace('\\', '/').TrimStart('/');
-        if (!IsSafeRelative(rel)) throw new InvalidOperationException("unsafe path in modrinth file: " + rel);
+        if (!IsSafeRelative(rel)) return (false, null, 0L, 0L, "unsafe path");
         var dest = Path.GetFullPath(Path.Combine(targetDir, rel));
-        if (!dest.StartsWith(targetDir, StringComparison.Ordinal)) throw new InvalidOperationException("out-of-root path: " + rel);
+        if (!dest.StartsWith(targetDir, StringComparison.Ordinal)) return (false, null, 0L, 0L, "out-of-root path");
         Directory.CreateDirectory(Path.GetDirectoryName(dest)!);
 
         // If exists and matches hash, skip
         if (File.Exists(dest) && f.Hashes.Count > 0)
         {
-            if (await VerifyHashAsync(dest, f.Hashes)) return;
+            if (await VerifyHashAsync(dest, f.Hashes))
+            {
+                var fi = new FileInfo(dest);
+                return (true, null, fi.Exists ? fi.Length : 0L, 0L, null);
+            }
         }
 
-        // Try each URL with simple retry
         Exception? last = null;
+        var sw = new Stopwatch();
         foreach (var url in f.Downloads)
         {
             for (int attempt = 1; attempt <= 3; attempt++)
             {
                 try
                 {
+                    Console.WriteLine($"  -> {f.Path} attempt {attempt}/3: {url}");
+                    sw.Restart();
                     using var resp = await http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
                     if (!resp.IsSuccessStatusCode)
                     {
-                        last = new HttpRequestException($"HTTP {(int)resp.StatusCode} for {url}");
+                        last = new HttpRequestException($"HTTP {(int)resp.StatusCode}");
                         continue;
                     }
                     var tmp = dest + ".part";
+                    long bytes = 0;
                     await using (var fs = File.Create(tmp))
                     {
                         await using var stream = await resp.Content.ReadAsStreamAsync();
                         await stream.CopyToAsync(fs);
+                        bytes = fs.Length;
                     }
-                    // verify
+                    var ms = sw.ElapsedMilliseconds;
                     if (f.Hashes.Count == 0 || await VerifyHashAsync(tmp, f.Hashes))
                     {
                         if (File.Exists(dest)) File.Delete(dest);
                         File.Move(tmp, dest);
-                        return;
+                        return (true, url, bytes, ms, null);
                     }
                     else
                     {
@@ -538,7 +574,7 @@ public static class PackImportService
                 }
             }
         }
-        throw last ?? new Exception("download failed");
+        return (false, null, 0L, 0L, last?.Message ?? "download failed");
     }
 
     private static async Task<bool> VerifyHashAsync(string path, Dictionary<string, string> hashes)

@@ -116,4 +116,31 @@ public class IntegrationTests
             try { Directory.Delete(root, recursive: true); } catch { /* ignore */ }
         }
     }
+
+    [Fact]
+    public async Task Manifest_Is_Cached_Between_Quick_Calls()
+    {
+        var (factory, client, root) = await CreateAppAsync();
+        await using var _ = factory; // dispose later
+        try
+        {
+            var json1 = await client.GetStringAsync("/packs/example-pack/manifest");
+            // tiny delay to avoid same-request artifacts, but keep within cache window
+            await Task.Delay(50);
+            var json2 = await client.GetStringAsync("/packs/example-pack/manifest");
+
+            using var doc1 = JsonDocument.Parse(json1);
+            using var doc2 = JsonDocument.Parse(json2);
+            var created1 = doc1.RootElement.GetProperty("createdAt").GetString();
+            var created2 = doc2.RootElement.GetProperty("createdAt").GetString();
+
+            Assert.False(string.IsNullOrEmpty(created1));
+            Assert.False(string.IsNullOrEmpty(created2));
+            Assert.Equal(created1, created2); // same cached manifest instance/materialized value
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { /* ignore */ }
+        }
+    }
 }

@@ -1,6 +1,8 @@
 using System.Collections.Concurrent;
 using System.Security.Cryptography;
 using System.Text.Json;
+using Microsoft.Extensions.Caching.Memory;
+using Microsoft.Extensions.Logging;
 using ModPackUpdater.Models;
 
 namespace ModPackUpdater.Services;
@@ -8,6 +10,20 @@ namespace ModPackUpdater.Services;
 public class PackService
 {
     private readonly string _root;
+    private readonly IMemoryCache _cache;
+    private readonly ILogger<PackService> _logger;
+
+    // prevent stampedes: one builder per pack key
+    private readonly ConcurrentDictionary<string, Lazy<Task<ModPackManifest?>>> _builders = new();
+    // file watchers per pack dir to invalidate cache on changes
+    private readonly ConcurrentDictionary<string, FileSystemWatcher> _watchers = new();
+
+    private static readonly MemoryCacheEntryOptions CacheEntryOptions = new MemoryCacheEntryOptions
+    {
+        AbsoluteExpirationRelativeToNow = TimeSpan.FromMinutes(5),
+        SlidingExpiration = TimeSpan.FromMinutes(2),
+        Size = 1
+    };
 
     private static readonly string[] DefaultIgnoreNames =
     {
@@ -16,10 +32,12 @@ public class PackService
         "Thumbs.db"
     };
 
-    public PackService(string packsRoot)
+    public PackService(string packsRoot, IMemoryCache cache, ILogger<PackService> logger)
     {
         _root = Path.GetFullPath(packsRoot);
         Directory.CreateDirectory(_root);
+        _cache = cache;
+        _logger = logger;
     }
 
     public IEnumerable<string> GetPackIds()
@@ -50,23 +68,107 @@ public class PackService
     {
         var dir = GetPackPath(packId);
         if (dir == null) return null;
-        var meta = await ReadPackMetaAsync(dir, ct);
-        var files = await EnumerateFilesWithHashesAsync(dir, ct);
-        var manifest = new ModPackManifest(
-            PackId: packId,
-            Version: "latest",
-            DisplayName: meta?.DisplayName ?? packId,
-            McVersion: meta?.McVersion,
-            Loader: meta?.LoaderName != null || meta?.LoaderVersion != null
-                ? new LoaderInfo(meta?.LoaderName ?? string.Empty, meta?.LoaderVersion ?? string.Empty)
-                : null,
-            Files: files,
-            CreatedAt: DateTimeOffset.UtcNow,
-            Channel: meta?.Channel,
-            Description: meta?.Description
-        );
-        return manifest;
+
+        // LATEST only at the moment, but include version in key to be future-proof
+        var cacheKey = GetManifestCacheKey(packId, version);
+        if (_cache.TryGetValue<ModPackManifest>(cacheKey, out var cached))
+        {
+            return cached;
+        }
+
+        EnsureWatcher(packId, dir);
+
+        // dedupe concurrent builders
+        var builder = _builders.GetOrAdd(cacheKey, _ => new Lazy<Task<ModPackManifest?>>(async () =>
+        {
+            try
+            {
+                var meta = await ReadPackMetaAsync(dir, ct);
+                var files = await EnumerateFilesWithHashesAsync(dir, ct);
+                var manifest = new ModPackManifest(
+                    PackId: packId,
+                    Version: "latest",
+                    DisplayName: meta?.DisplayName ?? packId,
+                    McVersion: meta?.McVersion,
+                    Loader: meta?.LoaderName != null || meta?.LoaderVersion != null
+                        ? new LoaderInfo(meta?.LoaderName ?? string.Empty, meta?.LoaderVersion ?? string.Empty)
+                        : null,
+                    Files: files,
+                    CreatedAt: DateTimeOffset.UtcNow,
+                    Channel: meta?.Channel,
+                    Description: meta?.Description
+                );
+
+                // store in cache
+                _cache.Set(cacheKey, manifest, CacheEntryOptions);
+                return manifest;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to build manifest for pack {PackId}", packId);
+                return null;
+            }
+        }, LazyThreadSafetyMode.ExecutionAndPublication));
+
+        try
+        {
+            var result = await builder.Value;
+            return result;
+        }
+        finally
+        {
+            // remove the builder so next miss creates a fresh one
+            _builders.TryRemove(cacheKey, out _);
+        }
     }
+
+    private void EnsureWatcher(string packId, string dir)
+    {
+        if (_watchers.ContainsKey(dir)) return;
+        try
+        {
+            var w = new FileSystemWatcher(dir)
+            {
+                IncludeSubdirectories = true,
+                EnableRaisingEvents = true,
+                NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName | NotifyFilters.LastWrite | NotifyFilters.CreationTime | NotifyFilters.Size
+            };
+
+            FileSystemEventHandler invalidate = (_, __) => Invalidate(packId);
+            RenamedEventHandler invalidateRenamed = (_, __) => Invalidate(packId);
+            ErrorEventHandler onError = (_, e) =>
+            {
+                _logger.LogDebug(e.GetException(), "Watcher error for pack {PackId}, will force invalidate", packId);
+                Invalidate(packId);
+            };
+
+            w.Changed += invalidate;
+            w.Created += invalidate;
+            w.Deleted += invalidate;
+            w.Renamed += invalidateRenamed;
+            w.Error += onError;
+
+            _watchers.TryAdd(dir, w);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Failed to create watcher for {Dir}", dir);
+        }
+    }
+
+    private void Invalidate(string packId)
+    {
+        try
+        {
+            var key = GetManifestCacheKey(packId, "latest");
+            _cache.Remove(key);
+            _builders.TryRemove(key, out _);
+            _logger.LogDebug("Invalidated cache for pack {PackId}", packId);
+        }
+        catch { /* best-effort */ }
+    }
+
+    private static string GetManifestCacheKey(string packId, string version) => $"manifest:{packId}:{version}";
 
     private async Task<PackMeta?> ReadPackMetaAsync(string dir, CancellationToken ct)
     {
