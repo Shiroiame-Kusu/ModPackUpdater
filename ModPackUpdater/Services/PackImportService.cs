@@ -2,12 +2,17 @@ using System.IO.Compression;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using ModPackUpdater.Models;
+using System.Net.Http; // added
+using System.Security.Cryptography; // added
 
 namespace ModPackUpdater.Services;
 
 public static class PackImportService
 {
-    public sealed record ImportOptions(string FilePath, string? PackId, string? Version, bool Overwrite);
+    public sealed record ImportOptions(string FilePath, string? PackId, string? Version, bool Overwrite, bool AutoDownload = true);
+
+    // Minimal representation of Modrinth index file entry
+    private sealed record MrFile(string Path, string[] Downloads, Dictionary<string, string> Hashes, string? EnvClient, string? EnvServer);
 
     private sealed record ArchiveMeta(
         string? PackId,
@@ -20,6 +25,14 @@ public static class PackImportService
         string? Channel,
         string? OverridesDir
     );
+
+    // Shared JSON helper
+    private static string? TryGetString(JsonElement obj, string name)
+    {
+        if (obj.ValueKind != JsonValueKind.Object) return null;
+        if (!obj.TryGetProperty(name, out var prop)) return null;
+        return prop.ValueKind == JsonValueKind.String ? prop.GetString() : null;
+    }
 
     public static async Task<int> Import(string packsRoot, ImportOptions opt)
     {
@@ -157,7 +170,56 @@ public static class PackImportService
                 extracted++;
             }
 
-            if (extracted == 0)
+            // Detect Modrinth index and parse files for auto-download
+            List<MrFile>? mrFiles = null;
+            try
+            {
+                var mrEntry = zip.Entries.FirstOrDefault(e => string.Equals(Path.GetFileName(e.FullName), "modrinth.index.json", StringComparison.OrdinalIgnoreCase));
+                if (mrEntry != null)
+                {
+                    using var mrs = mrEntry.Open();
+                    using var doc = JsonDocument.Parse(mrs);
+                    var root = doc.RootElement;
+                    if (root.TryGetProperty("files", out var filesEl) && filesEl.ValueKind == JsonValueKind.Array)
+                    {
+                        mrFiles = new List<MrFile>(filesEl.GetArrayLength());
+                        foreach (var f in filesEl.EnumerateArray())
+                        {
+                            // Required: path, hashes, downloads
+                            var p = TryGetString(f, "path");
+                            if (string.IsNullOrWhiteSpace(p)) continue;
+                            var dl = f.TryGetProperty("downloads", out var dls) && dls.ValueKind == JsonValueKind.Array
+                                ? dls.EnumerateArray().Select(x => x.GetString()).Where(x => !string.IsNullOrWhiteSpace(x)).Cast<string>().ToArray()
+                                : Array.Empty<string>();
+                            var hashes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                            if (f.TryGetProperty("hashes", out var hs) && hs.ValueKind == JsonValueKind.Object)
+                            {
+                                foreach (var prop in hs.EnumerateObject())
+                                {
+                                    if (prop.Value.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(prop.Value.GetString()))
+                                        hashes[prop.Name] = prop.Value.GetString()!;
+                                }
+                            }
+                            string? envClient = null, envServer = null;
+                            if (f.TryGetProperty("env", out var env) && env.ValueKind == JsonValueKind.Object)
+                            {
+                                envClient = TryGetString(env, "client");
+                                envServer = TryGetString(env, "server");
+                            }
+                            if (dl.Length > 0)
+                            {
+                                mrFiles.Add(new MrFile(p!, dl, hashes, envClient, envServer));
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine("Import warning: failed to parse modrinth.index.json: " + ex.Message);
+            }
+
+            if (extracted == 0 && (mrFiles == null || mrFiles.Count == 0))
             {
                 Console.Error.WriteLine("Import warning: no files extracted (maybe the pack only lists remote mods and has no overrides).");
             }
@@ -180,6 +242,13 @@ public static class PackImportService
             catch (Exception mex)
             {
                 Console.Error.WriteLine("Import warning: failed to write pack.json: " + mex.Message);
+            }
+
+            // Auto-download Modrinth files if present
+            if (opt.AutoDownload && mrFiles is { Count: > 0 })
+            {
+                Console.WriteLine($"Found {mrFiles.Count} remote file(s) in modrinth.index.json; downloading...");
+                await DownloadMrFilesAsync(targetDir, mrFiles);
             }
 
             Console.WriteLine("Import completed.");
@@ -299,13 +368,6 @@ public static class PackImportService
         {
             return false;
         }
-
-        static string? TryGetString(JsonElement obj, string name)
-        {
-            if (obj.ValueKind != JsonValueKind.Object) return null;
-            if (!obj.TryGetProperty(name, out var prop)) return null;
-            return prop.ValueKind == JsonValueKind.String ? prop.GetString() : null;
-        }
     }
 
     private static int CommonPrefix(List<string[]> paths)
@@ -381,5 +443,121 @@ public static class PackImportService
         s = s.Trim('-').Trim();
         if (string.IsNullOrWhiteSpace(s)) s = "1.0.0";
         return s;
+    }
+
+    // --- Auto-download helpers ---
+    private static async Task DownloadMrFilesAsync(string targetDir, List<MrFile> files)
+    {
+        using var http = new HttpClient();
+        http.Timeout = TimeSpan.FromSeconds(60);
+
+        // simple bounded concurrency
+        var throttler = new SemaphoreSlim(initialCount: Math.Clamp(Environment.ProcessorCount, 2, 8));
+        var tasks = new List<Task>();
+        int completed = 0;
+        foreach (var f in files)
+        {
+            await throttler.WaitAsync();
+            tasks.Add(Task.Run(async () =>
+            {
+                try
+                {
+                    await DownloadOneAsync(http, targetDir, f);
+                    var done = Interlocked.Increment(ref completed);
+                    if (done % 5 == 0 || done == files.Count)
+                        Console.WriteLine($"  downloaded {done}/{files.Count}...");
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine($"  failed to download {f.Path}: {ex.Message}");
+                }
+                finally
+                {
+                    throttler.Release();
+                }
+            }));
+        }
+        await Task.WhenAll(tasks);
+    }
+
+    private static async Task DownloadOneAsync(HttpClient http, string targetDir, MrFile f)
+    {
+        // Skip unsupported env entries (if pack is client-side by default)
+        if (string.Equals(f.EnvClient, "unsupported", StringComparison.OrdinalIgnoreCase))
+            return;
+
+        var rel = f.Path.Replace('\\', '/').TrimStart('/');
+        if (!IsSafeRelative(rel)) throw new InvalidOperationException("unsafe path in modrinth file: " + rel);
+        var dest = Path.GetFullPath(Path.Combine(targetDir, rel));
+        if (!dest.StartsWith(targetDir, StringComparison.Ordinal)) throw new InvalidOperationException("out-of-root path: " + rel);
+        Directory.CreateDirectory(Path.GetDirectoryName(dest)!);
+
+        // If exists and matches hash, skip
+        if (File.Exists(dest) && f.Hashes.Count > 0)
+        {
+            if (await VerifyHashAsync(dest, f.Hashes)) return;
+        }
+
+        // Try each URL with simple retry
+        Exception? last = null;
+        foreach (var url in f.Downloads)
+        {
+            for (int attempt = 1; attempt <= 3; attempt++)
+            {
+                try
+                {
+                    using var resp = await http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
+                    if (!resp.IsSuccessStatusCode)
+                    {
+                        last = new HttpRequestException($"HTTP {(int)resp.StatusCode} for {url}");
+                        continue;
+                    }
+                    var tmp = dest + ".part";
+                    await using (var fs = File.Create(tmp))
+                    {
+                        await using var stream = await resp.Content.ReadAsStreamAsync();
+                        await stream.CopyToAsync(fs);
+                    }
+                    // verify
+                    if (f.Hashes.Count == 0 || await VerifyHashAsync(tmp, f.Hashes))
+                    {
+                        if (File.Exists(dest)) File.Delete(dest);
+                        File.Move(tmp, dest);
+                        return;
+                    }
+                    else
+                    {
+                        File.Delete(tmp);
+                        last = new InvalidOperationException("hash mismatch");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    last = ex;
+                    await Task.Delay(TimeSpan.FromMilliseconds(200 * attempt));
+                }
+            }
+        }
+        throw last ?? new Exception("download failed");
+    }
+
+    private static async Task<bool> VerifyHashAsync(string path, Dictionary<string, string> hashes)
+    {
+        // Prefer sha512, then sha1
+        if (hashes.TryGetValue("sha512", out var sha512))
+        {
+            await using var fs = File.OpenRead(path);
+            var h = await SHA512.HashDataAsync(fs);
+            var actual = Convert.ToHexString(h).ToLowerInvariant();
+            return string.Equals(actual, sha512, StringComparison.OrdinalIgnoreCase);
+        }
+        if (hashes.TryGetValue("sha1", out var sha1))
+        {
+            await using var fs = File.OpenRead(path);
+            var h = await SHA1.HashDataAsync(fs);
+            var actual = Convert.ToHexString(h).ToLowerInvariant();
+            return string.Equals(actual, sha1, StringComparison.OrdinalIgnoreCase);
+        }
+        return false;
     }
 }

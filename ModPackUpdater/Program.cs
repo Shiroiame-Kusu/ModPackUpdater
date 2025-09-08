@@ -16,7 +16,7 @@ public class Program
         // Simple CLI: `import` subcommand to create packs from a .mcpack/.zip
         if (args.Length > 0 && string.Equals(args[0], "import", StringComparison.OrdinalIgnoreCase))
         {
-            var (file, packId, version, overwrite, showHelp) = ParseImportArgs(args);
+            var (file, packId, version, overwrite, autoDownload, showHelp) = ParseImportArgs(args);
             if (showHelp || string.IsNullOrWhiteSpace(file))
             {
                 PrintImportHelp();
@@ -38,7 +38,7 @@ public class Program
                 : Path.Combine(AppContext.BaseDirectory, "packs");
 
             // Delegate inference to importer; pass through optional overrides if provided
-            var code = await PackImportService.Import(packsRoot, new PackImportService.ImportOptions(file!, packId, version, overwrite));
+            var code = await PackImportService.Import(packsRoot, new PackImportService.ImportOptions(file!, packId, version, overwrite, autoDownload));
             Environment.Exit(code);
             return;
         }
@@ -100,9 +100,9 @@ public class Program
         app.Run();
     }
 
-    private static (string? file, string? packId, string? version, bool overwrite, bool help) ParseImportArgs(string[] args)
+    private static (string? file, string? packId, string? version, bool overwrite, bool autoDownload, bool help) ParseImportArgs(string[] args)
     {
-        string? file = null, packId = null, version = null; bool overwrite = false, help = false;
+        string? file = null, packId = null, version = null; bool overwrite = false, help = false; bool auto = true;
         for (int i = 1; i < args.Length; i++)
         {
             var a = args[i];
@@ -124,6 +124,11 @@ public class Program
                 case "-y":
                     overwrite = true;
                     break;
+                case "--no-download":
+                case "--no-dl":
+                case "-n":
+                    auto = false;
+                    break;
                 case "--help":
                 case "-h":
                     help = true;
@@ -134,13 +139,13 @@ public class Program
                     break;
             }
         }
-        return (file, packId, version, overwrite, help);
+        return (file, packId, version, overwrite, auto, help);
     }
 
     private static void PrintImportHelp()
     {
         Console.WriteLine(@"Usage:
-  ModPackUpdater import --file <path.(mcpack|mrpack|zip)> [--pack <id>] [--overwrite]
+  ModPackUpdater import --file <path.(mcpack|mrpack|zip)> [--pack <id>] [--overwrite] [--no-download]
 
 Imports the given archive into the packs directory configured by PacksRoot (or ./packs by default).
 This app uses a single-version model; each pack lives at packs/<id>/ and always represents 'latest'.
@@ -148,10 +153,11 @@ The importer reads name and metadata from inside the archive when possible (Bedr
 If pack id is still unknown, it falls back to the filename (before the last '-').
 
 Options:
-  -f, --file        Path to .mcpack, .mrpack, or .zip
-  -p, --pack        Pack ID override (folder name under packs/)
-  -y, --overwrite   Replace the existing pack folder if it exists
-  -h, --help        Show this help
+  -f, --file         Path to .mcpack, .mrpack, or .zip
+  -p, --pack         Pack ID override (folder name under packs/)
+  -y, --overwrite    Replace the existing pack folder if it exists
+  -n, --no-download  Disable auto-download of remote files (e.g., modrinth.index.json files)
+  -h, --help         Show this help
 ");
     }
 }
