@@ -34,7 +34,24 @@ public class PacksController : ControllerBase
         version ??= _svc.GetLatestVersion(packId);
         if (string.IsNullOrWhiteSpace(version)) return NotFound();
         var manifest = await _svc.TryGetManifestAsync(packId, version!, ct);
-        return manifest is null ? NotFound() : Ok(manifest);
+        if (manifest is null) return NotFound();
+        // Return manifest without mods list (moved to separate endpoint)
+        if (manifest.Mods != null)
+        {
+            manifest = manifest with { Mods = null };
+        }
+        return Ok(manifest);
+    }
+
+    // GET /packs/{packId}/mods?version=...
+    [HttpGet("{packId}/mods")]
+    public async Task<ActionResult<IEnumerable<ModInfo>>> GetMods([FromRoute] string packId, [FromQuery] string? version, CancellationToken ct)
+    {
+        version ??= _svc.GetLatestVersion(packId);
+        if (string.IsNullOrWhiteSpace(version)) return NotFound();
+        var manifest = await _svc.TryGetManifestAsync(packId, version!, ct);
+        if (manifest is null) return NotFound();
+        return Ok(manifest.Mods ?? Array.Empty<ModInfo>());
     }
 
     // GET /packs/{packId}/file?path=...&version=...

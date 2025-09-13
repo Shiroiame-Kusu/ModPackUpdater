@@ -5,6 +5,9 @@ A tiny ASP.NET Core service and CLI that hosts the "latest" version of Minecraft
 - Model: single-version per pack (always "latest" at `packs/<packId>/`)
 - Hashes: SHA-256, lower-hex
 - Paths: forward slashes, safe-relative only (no leading `/`, no `..`)
+- Caching: manifests are built once and cached in-memory with FS watcher invalidation and stampede protection
+- Startup warmup: optionally pre-generate manifests at application start
+- Mods metadata: manifest includes an optional `mods[]` with detected IDs, versions, and loaders
 - Logs: structured with Serilog to console and `logs/`
 
 See docs/CLIENT.md for a client mod integration guide. For deployment and admin usage, see docs/SERVER.md.
@@ -37,16 +40,32 @@ curl -sS http://localhost:5000/health
   - appsettings.json / appsettings.Development.json
   - or environment variable `PacksRoot`
   - default: `./packs` relative to the application base directory
+- Manifest warmup (pre-generate on startup): `ManifestWarmup`
+  - `Enabled`: true/false (default true)
+  - `BlockOnStartup`: true/false (default false — warmup runs in background after start)
+  - `MaxConcurrency`: integer (default ≈ CPU/2)
+- Manifest build concurrency: `Concurrency`
+  - `Hash`: max concurrent file hashing (default ≈ 2x cores, clamped 1–64)
+  - `ModExtract`: max concurrent mod metadata extraction (default ≈ cores/2, clamped 1–32)
 - Logging: Serilog writes to
   - console
   - `logs/app-YYYYMMDD.log` (application logs)
   - `logs/access-YYYYMMDD.log` (HTTP request access logs)
 
-Example appsettings override (Development already sets PacksRoot to `packs`):
+Example appsettings override:
 
 ```json
 {
-  "PacksRoot": "/absolute/path/to/packs"
+  "PacksRoot": "/absolute/path/to/packs",
+  "ManifestWarmup": {
+    "Enabled": true,
+    "BlockOnStartup": false,
+    "MaxConcurrency": 4
+  },
+  "Concurrency": {
+    "Hash": 8,
+    "ModExtract": 4
+  }
 }
 ```
 
@@ -64,7 +83,7 @@ PacksRoot/
     ...
 ```
 
-Ignored for hashing: `pack.json`, `.DS_Store`, `Thumbs.db`, and any dot-directories (e.g., `.git/`). Symlinks are skipped.
+Ignored for hashing: `pack.json`, `.DS_Store`, `Thumbs.db`, and any dot-directories (e.g., `.git/`). Symlinks are skipped (files and ancestor directories).
 
 ## Importer (CLI)
 
@@ -112,6 +131,7 @@ Base URL is your server root.
     - `mcVersion`: string|null
     - `loader`: `{ name, version } | null`
     - `files`: array of `{ path, sha256, size }`
+    - `mods`: array of `{ path, id|null, version|null, name|null, loader|null }` | null
     - `createdAt`: ISO-8601 string
     - `channel`: string|null
     - `description`: string|null
@@ -124,6 +144,7 @@ Base URL is your server root.
 Notes:
 - Version is always `latest`.
 - Paths must be safe-relative and use `/` separators.
+- The server skips symlinked files and files under symlinked directories.
 
 More client guidance and examples: docs/CLIENT.md
 

@@ -1,12 +1,22 @@
 # ModPackUpdater Client Mod Integration Guide
 
-This guide explains how to build a Minecraft client mod that integrates with ModPackUpdater. The server exposes a minimal HTTP API for discovering a pack, reading the latest manifest, and downloading files. Diffing is done client-side.
+This guide explains how to build a Minecraft client mod that integrates with ModPackUpdater. The server exposes a minimal HTTP API for discovering a pack, reading the latest manifest, listing mods, and downloading files. Diffing is done client-side.
 
 Model: single-version ("latest"). Each pack is stored at `packs/<packId>/` on the server and always represents the latest contents.
 
 - Hashing: SHA-256, lower-hex (64 chars)
 - Paths: forward slashes, relative only (no leading `/`, no `..` segments)
 - Ignored by server hashing: `pack.json`, `.DS_Store`, `Thumbs.db`, and any dot-directories (e.g., `.git/`)
+
+## Server manifest caching
+
+To prevent I/O exhaustion from repeated full directory scans, the server caches built manifests in memory per pack:
+- Cache TTL: ~5 minutes absolute, with a sliding refresh of ~2 minutes under access
+- Invalidation: file system watcher per pack; any change (create/update/delete/rename) invalidates the cache immediately
+- Concurrency control: stampede protection ensures only one manifest builder runs per pack at a time
+- Effect on clients: manifests may remain stable for a few minutes; `createdAt` reflects when the cached manifest was built
+
+Clients can optionally cache the manifest for a short period (e.g., 60–120s) to reduce polling.
 
 ## Configure
 
@@ -47,7 +57,7 @@ Base URL is your server root.
   - 200: `{ "packId": "string", "latestVersion": "latest", "versions": ["latest"] }`
   - 404: pack not found
 
-- GET /packs/{packId}/manifest
+- GET /packs/{packId}/manifest[?version=latest]
   - 200:
     ```json
     {
@@ -64,13 +74,19 @@ Base URL is your server root.
     ```
   - 404: pack not found
 
-- GET /packs/{packId}/file?path=relative/path
+- GET /packs/{packId}/mods[?version=latest]
+  - 200: `[ { "path": "string", "id": "string|null", "version": "string|null", "name": "string|null", "loader": "fabric|forge|neoforge|quilt|null" } ]`
+  - 404: pack not found
+
+- GET /packs/{packId}/file?path=relative/path[&version=latest]
   - 200: application/octet-stream (Range supported)
   - 404: pack or file not found
 
 Notes:
-- Version is always `latest` in responses.
+- Version is currently always `latest` in responses; the `version` query parameter is accepted for future compatibility.
 - All paths must be safe relative. Use forward slashes on all platforms.
+- The server skips symlinked files and files inside symlinked directories for safety.
+- Mods list moved out of the manifest to reduce payload size and allow lazy loading.
 
 ## Client-side diff algorithm
 
@@ -98,25 +114,26 @@ Apply:
 2) Get server manifest
 - GET `/packs/{packId}/manifest`
 
-3) Scan local files
+3) (Optional) Get mods metadata (for UI / audit / reporting)
+- GET `/packs/{packId}/mods`
+
+4) Scan local files
 - Recursively enumerate under `installRoot`
 - Exclude the ignore list above
-- For each file, compute SHA-256 (lower-hex) and collect `{ path, sha256, size }`, where `path` is the install-root-relative path with forward slashes
+- For each file, compute SHA-256 (lower-hex)
 
-4) Compute client-side diff
+5) Compute client-side diff
 - Compare server manifest to local scan as described
-- Produce operations: Add, Update, Delete
 
-5) Download changes
+6) Download changes
 - GET `/file?path=...` for each changed path and write to `installRoot`
 - After writing, re-hash updated files and verify against the manifest’s `sha256`
 
-6) Apply loader, if needed
-- Read loader info from `/packs/{packId}/manifest` (`loader.name`, `loader.version`, optionally `mcVersion`)
-- If the client’s loader differs, run the appropriate installer (Fabric/Forge/NeoForge/Quilt) before or after file sync, then restart if required
+7) Apply loader, if needed
+- Read loader info from manifest (`loader.name`, `loader.version`, optionally `mcVersion`)
 
-7) Repeat periodically
-- Re-fetch manifest, re-scan, compute diff, and apply changes. The server always represents the current latest.
+8) Repeat periodically
+- Re-fetch manifest, re-scan, compute diff, and apply changes.
 
 ## Implementation details
 
@@ -127,6 +144,8 @@ Apply:
 - Atomic writes: write to a temp file, fsync, then move/replace
 - Delete ops: remove files only after successful updates
 - Range downloads: `/file` supports HTTP Range for resume; optional to implement
+- Manifest caching: treat `createdAt` as a hint; a new manifest may appear a few minutes after files change due to cache TTL unless a change invalidates it sooner
+- Mod metadata sources: server extracts from multiple file types; some fields may be null or inferred
 
 ## Data contracts (summarized)
 
@@ -135,11 +154,21 @@ Apply:
   { "path": "string", "sha256": "string", "size": 0 }
   ```
 
+- Mod entry
+  ```json
+  { "path": "mods/example.jar", "id": "string|null", "version": "string|null", "name": "string|null", "loader": "fabric|forge|neoforge|quilt|null" }
+  ```
+
 ## cURL examples
 
 - Manifest
 ```bash
 curl -sS http://localhost:5000/packs/my-pack/manifest | jq .
+```
+
+- Mods
+```bash
+curl -sS http://localhost:5000/packs/my-pack/mods | jq .
 ```
 
 - File
@@ -151,8 +180,8 @@ curl -sS -OJ "http://localhost:5000/packs/my-pack/file?path=mods/example.jar"
 
 - 404 Not Found: pack or path doesn’t exist (re-check `packId`, `path`)
 - Empty diff: no operations => already up to date
-- No overrides in pack: importing may produce few files; still valid
-- Path safety: the server rejects unsafe paths (starting with `/` or containing `..`)
+- Path safety: server rejects unsafe paths (starting with `/` or containing `..`)
+- Mod metadata: some jars include placeholders or no metadata; fields may be null or filename-derived
 
 ## Security
 
@@ -164,12 +193,14 @@ curl -sS -OJ "http://localhost:5000/packs/my-pack/file?path=mods/example.jar"
 
 - [ ] Discover server and pack (health, summary)
 - [ ] Get manifest
+- [ ] (Optional) Get mods metadata
 - [ ] Scan installRoot and compute SHA-256 hashes (lower-hex)
 - [ ] Compute diff locally
 - [ ] Fetch changes via `/file`
 - [ ] Apply deletes and verify hashes
 - [ ] Handle loader install/update if needed
 - [ ] Implement retries, timeouts, and atomic writes
+- [ ] Optionally surface mods info to users (IDs, names, versions)
 
 ---
 
@@ -179,4 +210,4 @@ For server-side importing, use:
 ModPackUpdater import -f /path/to/pack.(mcpack|mrpack|zip) [-p mypack] [-y]
 ```
 
-The importer parses in-archive metadata (manifest.json or modrinth.index.json), extracts overrides, and writes a unified `pack.json`; in single-version mode it always updates `packs/<packId>/`.
+The importer parses in-archive metadata, extracts overrides, and writes a unified `pack.json`; in single-version mode it always updates `packs/<packId>/`.

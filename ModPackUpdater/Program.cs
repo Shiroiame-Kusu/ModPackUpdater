@@ -72,7 +72,18 @@ public class Program
                 ? (Path.IsPathRooted(cfgRoot) ? cfgRoot : Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, cfgRoot)))
                 : Path.Combine(AppContext.BaseDirectory, "packs");
             Log.Information("PacksRoot resolved to {PacksRoot}", root);
-            return new PackService(root, sp.GetRequiredService<IMemoryCache>(), sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<PackService>>());
+
+            // Concurrency settings
+            int? hashConc = cfg.GetValue<int?>("Concurrency:Hash");
+            int? modConc = cfg.GetValue<int?>("Concurrency:ModExtract");
+
+            return new PackService(
+                root,
+                sp.GetRequiredService<IMemoryCache>(),
+                sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<PackService>>() ,
+                hashConc,
+                modConc
+            );
         });
         builder.Services.AddControllers(options =>
         {
@@ -80,6 +91,36 @@ public class Program
         });
 
         var app = builder.Build();
+
+        // Optional: warm up manifests at startup to pre-populate cache and watchers
+        var warmupEnabled = app.Configuration.GetValue<bool?>("ManifestWarmup:Enabled") ?? true;
+        var warmupBlock = app.Configuration.GetValue<bool?>("ManifestWarmup:BlockOnStartup") ?? false;
+        var warmupMaxConc = app.Configuration.GetValue<int?>("ManifestWarmup:MaxConcurrency") ?? Math.Max(2, Environment.ProcessorCount / 2);
+        if (warmupEnabled)
+        {
+            if (warmupBlock)
+            {
+                try
+                {
+                    await WarmupManifestsAsync(app.Services, warmupMaxConc, CancellationToken.None);
+                }
+                catch (Exception ex)
+                {
+                    Log.Warning(ex, "Startup manifest warmup failed (continuing startup)");
+                }
+            }
+            else
+            {
+                app.Lifetime.ApplicationStarted.Register(() =>
+                {
+                    _ = Task.Run(async () =>
+                    {
+                        try { await WarmupManifestsAsync(app.Services, warmupMaxConc, CancellationToken.None); }
+                        catch (Exception ex) { Log.Warning(ex, "Background manifest warmup failed"); }
+                    });
+                });
+            }
+        }
 
         // Correlation + LogContext enrichment must come before request logging
         app.UseMiddleware<Middleware.CorrelationLoggingMiddleware>();
@@ -92,11 +133,40 @@ public class Program
             options.EnrichDiagnosticContext = (diag, httpContext) =>
             {
                 var req = httpContext.Request;
-                diag.Set("RequestHost", req.Host.Value);
-                diag.Set("RequestScheme", req.Scheme);
+                var scheme = req.Scheme;
+                if (req.Headers.TryGetValue("X-Forwarded-Proto", out var xfProto) && !Microsoft.Extensions.Primitives.StringValues.IsNullOrEmpty(xfProto))
+                {
+                    var proto = xfProto.ToString().Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).FirstOrDefault();
+                    scheme = string.IsNullOrWhiteSpace(proto) ? scheme : proto;
+                }
+
+                var host = req.Host.Value;
+                if (req.Headers.TryGetValue("X-Forwarded-Host", out var xfHost) && !Microsoft.Extensions.Primitives.StringValues.IsNullOrEmpty(xfHost))
+                {
+                    var fhost = xfHost.ToString().Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).FirstOrDefault();
+                    host = string.IsNullOrWhiteSpace(fhost) ? host : fhost;
+                }
+
+                var path = req.Path.HasValue ? req.Path.Value : string.Empty;
+                var query = req.QueryString.HasValue ? req.QueryString.Value : string.Empty;
+                var fullUrl = string.Concat(scheme, "://", host, path, query);
+
+                // Prefer X-Forwarded-For (first IP) when present, else RemoteIpAddress
+                string? clientIp = null;
+                if (req.Headers.TryGetValue("X-Forwarded-For", out var xff) && !Microsoft.Extensions.Primitives.StringValues.IsNullOrEmpty(xff))
+                {
+                    var first = xff.ToString().Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).FirstOrDefault();
+                    clientIp = string.IsNullOrWhiteSpace(first) ? null : first;
+                }
+                clientIp ??= httpContext.Connection.RemoteIpAddress?.ToString();
+
+                diag.Set("RequestHost", host);
+                diag.Set("RequestScheme", scheme);
                 diag.Set("UserAgent", req.Headers.UserAgent.ToString());
-                diag.Set("QueryString", httpContext.Request.QueryString.HasValue ? httpContext.Request.QueryString.Value : "");
+                diag.Set("QueryString", req.QueryString.HasValue ? req.QueryString.Value : "");
                 diag.Set("RemoteIpAddress", httpContext.Connection.RemoteIpAddress?.ToString());
+                diag.Set("ClientIp", clientIp ?? "");
+                diag.Set("FullUrl", fullUrl);
                 if (httpContext.Items.TryGetValue("CorrelationId", out var corr) && corr is string s)
                     diag.Set("CorrelationId", s);
             };
@@ -106,6 +176,44 @@ public class Program
         app.MapControllers();
 
         app.Run();
+    }
+
+    private static async Task WarmupManifestsAsync(IServiceProvider services, int maxConcurrency, CancellationToken ct)
+    {
+        using var scope = services.CreateScope();
+        var svc = scope.ServiceProvider.GetRequiredService<PackService>();
+        var ids = svc.GetPackIds().ToList();
+        if (ids.Count == 0)
+        {
+            Log.Information("No packs found for warmup");
+            return;
+        }
+        Log.Information("Warming up manifests for {Count} pack(s) with concurrency {Conc}", ids.Count, maxConcurrency);
+        var sem = new SemaphoreSlim(Math.Max(1, maxConcurrency));
+        var tasks = ids.Select(async id =>
+        {
+            await sem.WaitAsync(ct);
+            try
+            {
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                var manifest = await svc.TryGetManifestAsync(id, "latest", ct);
+                sw.Stop();
+                if (manifest != null)
+                    Log.Information("Warmup built manifest for {PackId} in {Ms} ms", id, sw.ElapsedMilliseconds);
+                else
+                    Log.Warning("Warmup failed to build manifest for {PackId}", id);
+            }
+            catch (Exception ex)
+            {
+                Log.Warning(ex, "Warmup error for pack {PackId}", id);
+            }
+            finally
+            {
+                try { sem.Release(); } catch { }
+            }
+        });
+        await Task.WhenAll(tasks);
+        Log.Information("Manifest warmup complete");
     }
 
     private static (string? file, string? packId, string? version, bool overwrite, bool autoDownload, bool help) ParseImportArgs(string[] args)

@@ -6,6 +6,8 @@ using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.Configuration;
 using Xunit;
 using Xunit.Abstractions;
+using System.IO.Compression;
+using System.Linq;
 
 namespace ModPackUpdater.Tests;
 
@@ -141,6 +143,180 @@ public class IntegrationTests
         finally
         {
             try { Directory.Delete(root, recursive: true); } catch { /* ignore */ }
+        }
+    }
+
+    [Fact]
+    public async Task Manifest_Includes_Mod_Versions_When_Present()
+    {
+        var (factory, client, root) = await CreateAppAsync();
+        await using var _ = factory; // dispose later
+        try
+        {
+            // Create a valid mod JAR with fabric.mod.json before requesting mods
+            var jarPath = Path.Combine(root, "example-pack", "mods", "fabric-example.jar");
+            using (var fs = File.Create(jarPath))
+            using (var zip = new ZipArchive(fs, ZipArchiveMode.Create))
+            {
+                var entry = zip.CreateEntry("fabric.mod.json");
+                await using var es = entry.Open();
+                var content = """
+                {
+                  "schemaVersion": 1,
+                  "id": "fabric_example",
+                  "version": "1.2.3",
+                  "name": "Fabric Example"
+                }
+                """;
+                var bytes = Encoding.UTF8.GetBytes(content);
+                await es.WriteAsync(bytes, 0, bytes.Length);
+            }
+
+            // Request mods endpoint and verify list contains our mod with version
+            var modsText = await client.GetStringAsync("/packs/example-pack/mods");
+            _output.WriteLine($"mods: {modsText}");
+            using var doc = JsonDocument.Parse(modsText);
+            var modsArr = doc.RootElement.EnumerateArray().ToArray();
+            Assert.Contains(modsArr, m => m.GetProperty("path").GetString() == "mods/fabric-example.jar");
+            var mod = modsArr.First(m => m.GetProperty("path").GetString() == "mods/fabric-example.jar");
+            Assert.Equal("fabric_example", mod.GetProperty("id").GetString());
+            Assert.Equal("1.2.3", mod.GetProperty("version").GetString());
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { /* ignore */ }
+        }
+    }
+
+    [Fact]
+    public async Task Mods_Endpoint_Extracts_Version_From_PomProperties()
+    {
+        var (factory, client, root) = await CreateAppAsync();
+        await using var _ = factory;
+        try
+        {
+            var jarPath = Path.Combine(root, "example-pack", "mods", "example-lib.jar");
+            using (var fs = File.Create(jarPath))
+            using (var zip = new ZipArchive(fs, ZipArchiveMode.Create))
+            {
+                var entry = zip.CreateEntry("META-INF/maven/com.example/example-lib/pom.properties");
+                await using var es = entry.Open();
+                var content = """
+                version=9.9.9
+                artifactId=example-lib
+                name=Example Lib
+                """;
+                var bytes = Encoding.UTF8.GetBytes(content);
+                await es.WriteAsync(bytes, 0, bytes.Length);
+            }
+
+            var modsText = await client.GetStringAsync("/packs/example-pack/mods");
+            using var doc = JsonDocument.Parse(modsText);
+            var modsArr = doc.RootElement.EnumerateArray().ToArray();
+            var mod = modsArr.FirstOrDefault(m => m.GetProperty("path").GetString() == "mods/example-lib.jar");
+            Assert.True(mod.ValueKind != JsonValueKind.Undefined);
+            Assert.Equal("9.9.9", mod.GetProperty("version").GetString());
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task Mods_Endpoint_Extracts_From_mcmod_info()
+    {
+        var (factory, client, root) = await CreateAppAsync();
+        await using var _ = factory;
+        try
+        {
+            var jarPath = Path.Combine(root, "example-pack", "mods", "old-forge-mod.jar");
+            using (var fs = File.Create(jarPath))
+            using (var zip = new ZipArchive(fs, ZipArchiveMode.Create))
+            {
+                var entry = zip.CreateEntry("mcmod.info");
+                await using var es = entry.Open();
+                var content = """
+                [
+                  {
+                    "modid": "oldmod",
+                    "name": "Old Forge Mod",
+                    "version": "0.4.2"
+                  }
+                ]
+                """;
+                var bytes = Encoding.UTF8.GetBytes(content);
+                await es.WriteAsync(bytes, 0, bytes.Length);
+            }
+
+            var modsText = await client.GetStringAsync("/packs/example-pack/mods");
+            using var doc = JsonDocument.Parse(modsText);
+            var modsArr = doc.RootElement.EnumerateArray().ToArray();
+            var mod = modsArr.FirstOrDefault(m => m.GetProperty("path").GetString() == "mods/old-forge-mod.jar");
+            Assert.True(mod.ValueKind != JsonValueKind.Undefined);
+            Assert.Equal("0.4.2", mod.GetProperty("version").GetString());
+            Assert.Equal("oldmod", mod.GetProperty("id").GetString());
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task Mods_Endpoint_Extracts_From_NeoForge_Toml()
+    {
+        var (factory, client, root) = await CreateAppAsync();
+        await using var _ = factory;
+        try
+        {
+            var jarPath = Path.Combine(root, "example-pack", "mods", "neoforge-mod.jar");
+            using (var fs = File.Create(jarPath))
+            using (var zip = new ZipArchive(fs, ZipArchiveMode.Create))
+            {
+                var entry = zip.CreateEntry("META-INF/neoforge.mods.toml");
+                await using var es = entry.Open();
+                var content = """
+                modLoader="javafml"
+                loaderVersion="[2,)"
+                [[mods]]
+                modId="neotest"
+                version="2.3.4"
+                displayName="Neo Test Mod"
+                """;
+                var bytes = Encoding.UTF8.GetBytes(content);
+                await es.WriteAsync(bytes, 0, bytes.Length);
+            }
+
+            var modsText = await client.GetStringAsync("/packs/example-pack/mods");
+            using var doc = JsonDocument.Parse(modsText);
+            var modsArr = doc.RootElement.EnumerateArray().ToArray();
+            var mod = modsArr.FirstOrDefault(m => m.GetProperty("path").GetString() == "mods/neoforge-mod.jar");
+            Assert.True(mod.ValueKind != JsonValueKind.Undefined);
+            Assert.Equal("neotest", mod.GetProperty("id").GetString());
+            Assert.Equal("2.3.4", mod.GetProperty("version").GetString());
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task Manifest_Does_Not_Include_Mods_List_After_Split()
+    {
+        var (factory, client, root) = await CreateAppAsync();
+        await using var _ = factory;
+        try
+        {
+            var manifestText = await client.GetStringAsync("/packs/example-pack/manifest");
+            using var doc = JsonDocument.Parse(manifestText);
+            var rootEl = doc.RootElement;
+            Assert.False(rootEl.TryGetProperty("mods", out _)); // property should be omitted entirely now
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { }
         }
     }
 }

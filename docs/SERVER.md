@@ -109,6 +109,13 @@ PacksRoot=/srv/modpacks/packs \
   - appsettings.Development.json sets `"PacksRoot": "packs"` by default
   - You can override via environment variable `PacksRoot`
   - Relative paths are resolved from `AppContext.BaseDirectory` (the app’s working dir)
+- ManifestWarmup: pre-generate and cache manifests at startup (optional)
+  - Enabled (bool, default true): toggles warmup
+  - BlockOnStartup (bool, default false): if true, the app waits for warmup before accepting requests; otherwise runs in background after the app starts
+  - MaxConcurrency (int, default 4): limits parallel manifest builds during warmup
+- Concurrency: tune I/O and CPU parallelism for manifest building (optional)
+  - Concurrency:Hash (int, optional): max concurrent file hashing; default is based on CPU (≈ 2x cores, clamped 1–64)
+  - Concurrency:ModExtract (int, optional): max concurrent mod metadata extractions; default is based on CPU (≈ cores/2, clamped 1–32)
 - Logging: configured via Serilog in `appsettings.json`
   - Console output
   - Files under `logs/` (daily rolling):
@@ -120,7 +127,16 @@ Example JSON override:
 
 ```json
 {
-  "PacksRoot": "/srv/modpacks/packs"
+  "PacksRoot": "/srv/modpacks/packs",
+  "ManifestWarmup": {
+    "Enabled": true,
+    "BlockOnStartup": false,
+    "MaxConcurrency": 4
+  },
+  "Concurrency": {
+    "Hash": 8,
+    "ModExtract": 4
+  }
 }
 ```
 
@@ -177,7 +193,8 @@ Return codes: 0 success; non-zero indicates an error (see stderr messages).
 - GET /health → `{ "status": "ok" }`
 - GET /packs/ → `string[]` of pack IDs (folders under PacksRoot)
 - GET /packs/{id} → summary `{ packId, latestVersion: "latest", versions: ["latest"] }`
-- GET /packs/{id}/manifest → manifest `{ files: [{ path, sha256, size }], ... }`
+- GET /packs/{id}/manifest → manifest (file list + metadata; no embedded mods list)
+- GET /packs/{id}/mods → array of mod metadata
 - GET /packs/{id}/file?path=relative/path → file bytes (Range supported)
 
 See docs/CLIENT.md for client-side diff and usage patterns.
@@ -336,6 +353,10 @@ Optional: add Basic/OAuth at the proxy if you need authentication.
   - A: Add auth at your reverse proxy (e.g., Basic, OAuth2). The service itself is unauthenticated by default.
 - Q: How big can packs be?
   - A: There’s no hard-coded limit; bandwidth and disk space are the primary constraints.
+- Q: Can manifests be pre-generated at startup?
+  - A: Yes. Set `ManifestWarmup.Enabled=true`. To block until warmup completes, set `ManifestWarmup.BlockOnStartup=true`. Tune parallelism via `ManifestWarmup.MaxConcurrency`.
+- Q: Where did the mods list in the manifest go?
+  - A: It was split into a dedicated `/packs/{id}/mods` endpoint to reduce manifest size and allow lazy loading.
 
 ## Useful cURL
 
@@ -345,6 +366,9 @@ curl -sS http://localhost:5000/packs/ | jq .
 
 # Manifest
 curl -sS http://localhost:5000/packs/my-pack/manifest | jq .
+
+# Mods
+curl -sS http://localhost:5000/packs/my-pack/mods | jq .
 
 # Download a file
 curl -sS -OJ "http://localhost:5000/packs/my-pack/file?path=mods/example.jar"
